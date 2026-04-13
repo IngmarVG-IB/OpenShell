@@ -22,7 +22,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 const MAX_HEADER_BYTES: usize = 8192;
 const INFERENCE_LOCAL_HOST: &str = "inference.local";
@@ -299,9 +299,39 @@ async fn handle_tcp_connection(
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     let mut buf = vec![0u8; MAX_HEADER_BYTES];
-    let mut used = 0usize;
 
+    // Read the first chunk to determine whether this is an explicit proxy
+    // request (CONNECT / forward proxy) or a transparently redirected
+    // connection (raw TLS from iptables DNAT).
+    let mut used = client.read(&mut buf).await.into_diagnostic()?;
+    if used == 0 {
+        return Ok(());
+    }
+
+    // Transparent proxy detection: if the first bytes look like a TLS
+    // ClientHello, this connection was DNAT'd by iptables (the client
+    // bypassed the explicit HTTP CONNECT proxy). Extract the SNI hostname
+    // and handle as an implicit CONNECT tunnel.
+    if crate::l7::tls::looks_like_tls(&buf[..used]) {
+        return handle_transparent_proxy(
+            client,
+            &buf[..used],
+            opa_engine,
+            identity_cache,
+            entrypoint_pid,
+            tls_state,
+            secret_resolver,
+            denial_tx,
+        )
+        .await;
+    }
+
+    // Explicit proxy path: read remaining headers until \r\n\r\n.
     loop {
+        if buf[..used].windows(4).any(|win| win == b"\r\n\r\n") {
+            break;
+        }
+
         if used == buf.len() {
             respond(
                 &mut client,
@@ -316,10 +346,6 @@ async fn handle_tcp_connection(
             return Ok(());
         }
         used += n;
-
-        if buf[..used].windows(4).any(|win| win == b"\r\n\r\n") {
-            break;
-        }
     }
 
     let request = String::from_utf8_lossy(&buf[..used]);
@@ -1925,6 +1951,152 @@ fn rewrite_forward_request(
     }
 
     Ok(output)
+}
+
+/// Handle a transparently redirected connection (iptables DNAT).
+///
+/// When a sandbox application connects directly to a remote host on port 80 or
+/// 443 without going through the explicit HTTP CONNECT proxy, the iptables nat
+/// DNAT rule redirects the TCP connection to this proxy. The first bytes are
+/// raw application data (typically a TLS ClientHello), not an HTTP CONNECT
+/// request.
+///
+/// This function:
+/// 1. Reads enough data to extract the SNI hostname from the TLS ClientHello
+/// 2. Evaluates OPA policy for the destination
+/// 3. Resolves DNS with SSRF protection
+/// 4. Connects to the real upstream
+/// 5. Replays the buffered ClientHello data
+/// 6. Relays bidirectionally (the TLS handshake completes end-to-end between
+///    client and upstream — no MITM termination)
+#[allow(clippy::too_many_arguments)]
+async fn handle_transparent_proxy(
+    mut client: TcpStream,
+    initial_data: &[u8],
+    opa_engine: Arc<OpaEngine>,
+    identity_cache: Arc<BinaryIdentityCache>,
+    entrypoint_pid: Arc<AtomicU32>,
+    _tls_state: Option<Arc<ProxyTlsState>>,
+    _secret_resolver: Option<Arc<SecretResolver>>,
+    denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
+) -> Result<()> {
+    // Buffer for accumulating the ClientHello if the first read wasn't enough.
+    let mut buf = Vec::with_capacity(MAX_HEADER_BYTES);
+    buf.extend_from_slice(initial_data);
+
+    // Try to extract SNI. If the first chunk wasn't enough, read more.
+    let mut sni = crate::l7::tls::extract_sni(&buf);
+    while sni.is_none() && buf.len() < MAX_HEADER_BYTES {
+        let mut tmp = vec![0u8; 4096];
+        let n = client.read(&mut tmp).await.into_diagnostic()?;
+        if n == 0 {
+            break;
+        }
+        buf.extend_from_slice(&tmp[..n]);
+        sni = crate::l7::tls::extract_sni(&buf);
+    }
+
+    let host = match sni {
+        Some(h) => h,
+        None => {
+            warn!("Transparent proxy: no SNI found in ClientHello, dropping connection");
+            return Ok(());
+        }
+    };
+    let host_lc = host.to_ascii_lowercase();
+    let port = 443u16;
+
+    let peer_addr = client.peer_addr().into_diagnostic()?;
+
+    info!(
+        host = %host_lc,
+        port = port,
+        peer = %peer_addr,
+        "Transparent proxy: routing DNAT'd connection via SNI"
+    );
+
+    // Evaluate OPA policy (same identity binding as CONNECT).
+    let decision = evaluate_opa_tcp(
+        peer_addr,
+        &opa_engine,
+        &identity_cache,
+        &entrypoint_pid,
+        &host_lc,
+        port,
+    );
+
+    match &decision.action {
+        NetworkAction::Deny { reason } => {
+            let binary_str = decision
+                .binary
+                .as_ref()
+                .map_or_else(|| "-".to_string(), |p| p.display().to_string());
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                .src_endpoint_addr(peer_addr.ip(), peer_addr.port())
+                .firewall_rule("-", "opa")
+                .message(format!("Transparent proxy denied {host_lc}:{port}"))
+                .status_detail(reason)
+                .build();
+            ocsf_emit!(event);
+            emit_denial(
+                &denial_tx,
+                &host_lc,
+                port,
+                &binary_str,
+                &decision,
+                reason,
+                "transparent",
+            );
+            // Drop the connection — there's no HTTP response to send since
+            // the client expects raw TLS, not HTTP error codes.
+            return Ok(());
+        }
+        NetworkAction::Allow { .. } => {}
+    }
+
+    // DNS resolution with SSRF protection.
+    let addrs = match resolve_and_reject_internal(&host_lc, port).await {
+        Ok(addrs) => addrs,
+        Err(reason) => {
+            warn!(
+                host = %host_lc,
+                port = port,
+                reason = %reason,
+                "Transparent proxy: SSRF check blocked connection"
+            );
+            return Ok(());
+        }
+    };
+
+    // Connect to the real upstream.
+    let mut upstream = match TcpStream::connect(addrs.as_slice()).await {
+        Ok(s) => s,
+        Err(e) => {
+            warn!(
+                host = %host_lc,
+                port = port,
+                error = %e,
+                "Transparent proxy: upstream connection failed"
+            );
+            return Ok(());
+        }
+    };
+
+    // Replay the buffered ClientHello to upstream.
+    upstream.write_all(&buf).await.into_diagnostic()?;
+
+    // Relay bidirectionally — the TLS handshake completes end-to-end.
+    let _ = tokio::io::copy_bidirectional(&mut client, &mut upstream)
+        .await
+        .into_diagnostic()?;
+
+    Ok(())
 }
 
 /// Handle a plain HTTP forward proxy request (non-CONNECT).

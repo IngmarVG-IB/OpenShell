@@ -97,7 +97,8 @@ fn hint_for_event(event: &BypassEvent) -> &'static str {
     } else if event.proto == "udp" {
         "UDP traffic must route through the sandbox proxy"
     } else {
-        "ensure process honors HTTP_PROXY/HTTPS_PROXY; for Node.js set NODE_USE_ENV_PROXY=1"
+        "TCP on non-standard port bypassed proxy; ports 80/443 are transparently redirected, \
+         but other ports require the process to honor HTTP_PROXY/HTTPS_PROXY"
     }
 }
 

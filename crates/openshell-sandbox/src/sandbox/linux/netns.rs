@@ -232,23 +232,38 @@ impl NetworkNamespace {
         self.ns_fd
     }
 
-    /// Install iptables rules for bypass detection inside the namespace.
+    /// Install iptables rules for transparent proxy redirect and bypass
+    /// detection inside the namespace.
     ///
-    /// Sets up OUTPUT chain rules that:
+    /// Sets up two rule sets:
+    ///
+    /// **nat table (OUTPUT chain) — transparent redirect:**
+    /// - DNAT TCP traffic on ports 80 and 443 (excluding traffic already
+    ///   destined for the proxy) to the proxy address. This ensures that
+    ///   libraries which do not honor `HTTP_PROXY`/`HTTPS_PROXY` environment
+    ///   variables (e.g. the `ws` npm package used by Discord.js) still route
+    ///   through the sandbox proxy. The proxy detects these connections via
+    ///   TLS ClientHello SNI extraction and handles them as implicit CONNECT
+    ///   tunnels.
+    ///
+    /// **filter table (OUTPUT chain) — bypass detection:**
     /// 1. ACCEPT traffic destined for the proxy (host_ip:proxy_port)
     /// 2. ACCEPT loopback traffic
     /// 3. ACCEPT established/related connections (response packets)
-    /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts)
+    /// 4. LOG + REJECT all other TCP/UDP traffic (bypass attempts on
+    ///    non-standard ports, plus all UDP)
     ///
-    /// This provides two benefits:
-    /// - **Fast-fail UX**: applications get immediate ECONNREFUSED instead of
-    ///   a 30-second timeout when they bypass the proxy
+    /// This provides three benefits:
+    /// - **Transparent proxy**: applications that bypass the explicit HTTP
+    ///   CONNECT proxy on ports 80/443 are silently redirected
+    /// - **Fast-fail UX**: applications on non-standard ports get immediate
+    ///   ECONNREFUSED instead of a 30-second timeout
     /// - **Diagnostics**: iptables LOG entries are picked up by the bypass
     ///   monitor to emit structured tracing events
     ///
     /// Degrades gracefully if `iptables` is not available — the namespace
-    /// still provides isolation via routing, just without fast-fail and
-    /// diagnostic logging.
+    /// still provides isolation via routing, just without transparent redirect,
+    /// fast-fail, or diagnostic logging.
     pub fn install_bypass_rules(&self, proxy_port: u16) -> Result<()> {
         // Check if iptables is available before attempting to install rules.
         let iptables_path = match find_iptables() {
@@ -273,10 +288,28 @@ impl NetworkNamespace {
         let proxy_port_str = proxy_port.to_string();
         let log_prefix = format!("openshell:bypass:{}:", &self.name);
 
-        // "Installing bypass detection rules" is a transient step — skip OCSF.
-        // The completion event below covers the outcome.
+        // Install transparent redirect rules (nat table DNAT) — best-effort.
+        // These redirect TCP 80/443 bypass traffic to the proxy so that
+        // applications ignoring HTTP_PROXY env vars still get proxied.
+        if let Err(e) = self.install_transparent_redirect(
+            &iptables_path,
+            &host_ip_str,
+            &proxy_port_str,
+        ) {
+            openshell_ocsf::ocsf_emit!(openshell_ocsf::ConfigStateChangeBuilder::new(
+                crate::ocsf_ctx()
+            )
+            .severity(openshell_ocsf::SeverityId::Low)
+            .status(openshell_ocsf::StatusId::Failure)
+            .state(openshell_ocsf::StateId::Other, "degraded")
+            .message(format!(
+                "Failed to install transparent redirect rules (non-fatal) [ns:{}]: {e}",
+                self.name
+            ))
+            .build());
+        }
 
-        // Install IPv4 rules
+        // Install IPv4 filter rules (bypass detection)
         if let Err(e) = self.install_bypass_rules_for(
             &iptables_path,
             &host_ip_str,
@@ -321,10 +354,56 @@ impl NetworkNamespace {
                 .status(openshell_ocsf::StatusId::Success)
                 .state(openshell_ocsf::StateId::Enabled, "installed")
                 .message(format!(
-                    "Bypass detection rules installed [ns:{}]",
+                    "Transparent redirect and bypass detection rules installed [ns:{}]",
                     self.name
                 ))
                 .build()
+        );
+
+        Ok(())
+    }
+
+    /// Install nat/OUTPUT DNAT rules that transparently redirect TCP traffic
+    /// on common ports (80, 443) to the proxy.
+    ///
+    /// Traffic already destined for the proxy is excluded (it will use the
+    /// explicit CONNECT protocol). Only new outbound connections on these
+    /// ports are redirected — established/related flows are handled by
+    /// conntrack automatically.
+    fn install_transparent_redirect(
+        &self,
+        iptables_cmd: &str,
+        host_ip: &str,
+        proxy_port: &str,
+    ) -> Result<()> {
+        for port in &["443", "80"] {
+            run_iptables_netns(
+                &self.name,
+                iptables_cmd,
+                &[
+                    "-t",
+                    "nat",
+                    "-A",
+                    "OUTPUT",
+                    "-p",
+                    "tcp",
+                    "--dport",
+                    port,
+                    // Exclude traffic already going to the proxy.
+                    "!",
+                    "-d",
+                    &format!("{host_ip}/32"),
+                    "-j",
+                    "DNAT",
+                    "--to-destination",
+                    &format!("{host_ip}:{proxy_port}"),
+                ],
+            )?;
+        }
+
+        info!(
+            namespace = %self.name,
+            "Transparent proxy redirect rules installed (TCP 80, 443)"
         );
 
         Ok(())
@@ -872,6 +951,33 @@ mod tests {
         assert!(
             !std::path::Path::new(&ns_path).exists(),
             "Namespace should be cleaned up"
+        );
+    }
+
+    #[test]
+    #[ignore = "requires root privileges"]
+    fn test_transparent_redirect_installs_nat_rules() {
+        let ns = NetworkNamespace::create().expect("Failed to create namespace");
+
+        // Install transparent redirect rules
+        let iptables_path = find_iptables().expect("iptables not found");
+        ns.install_transparent_redirect(&iptables_path, "10.200.0.1", "3128")
+            .expect("Failed to install transparent redirect rules");
+
+        // Verify nat table OUTPUT chain has DNAT rules for ports 443 and 80
+        let output = Command::new("ip")
+            .args(["netns", "exec", ns.name(), &iptables_path, "-t", "nat", "-L", "OUTPUT", "-n"])
+            .output()
+            .expect("Failed to list nat rules");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+
+        assert!(
+            stdout.contains("dpt:443") && stdout.contains("10.200.0.1:3128"),
+            "Expected DNAT rule for port 443, got: {stdout}"
+        );
+        assert!(
+            stdout.contains("dpt:80") && stdout.contains("10.200.0.1:3128"),
+            "Expected DNAT rule for port 80, got: {stdout}"
         );
     }
 }

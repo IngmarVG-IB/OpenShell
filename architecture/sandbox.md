@@ -537,31 +537,59 @@ Each step has rollback on failure -- if any `ip` command fails, previously creat
 2. Delete the host-side veth (`ip link delete veth-h-{id}`) -- this automatically removes the peer
 3. Delete the namespace (`ip netns delete sandbox-{id}`)
 
-#### Bypass detection
+#### Transparent proxy redirect and bypass detection
 
-**Files:** `crates/openshell-sandbox/src/sandbox/linux/netns.rs` (`install_bypass_rules()`), `crates/openshell-sandbox/src/bypass_monitor.rs`
+**Files:** `crates/openshell-sandbox/src/sandbox/linux/netns.rs` (`install_bypass_rules()`, `install_transparent_redirect()`), `crates/openshell-sandbox/src/proxy.rs` (`handle_transparent_proxy()`), `crates/openshell-sandbox/src/l7/tls.rs` (`extract_sni()`), `crates/openshell-sandbox/src/bypass_monitor.rs`
 
-The network namespace routes all sandbox traffic through the veth pair, but a misconfigured process that ignores proxy environment variables can still attempt direct connections to the veth gateway IP or other addresses. Bypass detection catches these attempts, providing two benefits: immediate connection failure (fast-fail UX) instead of a 30-second TCP timeout, and structured diagnostic logging that identifies the offending process.
+The network namespace routes all sandbox traffic through the veth pair, but many libraries (e.g. the `ws` npm package used by Discord.js) do not honor `HTTP_PROXY`/`HTTPS_PROXY` environment variables for WebSocket or raw TCP connections. Two mechanisms handle this:
+
+1. **Transparent redirect** — iptables nat DNAT rules redirect TCP traffic on ports 80 and 443 to the proxy, which extracts the destination from the TLS ClientHello SNI extension and relays end-to-end.
+2. **Bypass detection** — filter table rules LOG and REJECT traffic on non-standard ports, providing fast-fail UX and diagnostic logging.
 
 ##### iptables rules
 
-`install_bypass_rules()` installs OUTPUT chain rules inside the sandbox network namespace using `iptables` (IPv4) and `ip6tables` (IPv6, best-effort). Rules are installed via `ip netns exec {namespace} iptables ...`. The rules are evaluated in order:
+`install_bypass_rules()` installs two sets of rules inside the sandbox network namespace:
+
+**nat table (OUTPUT chain) — transparent redirect:**
 
 | # | Rule | Target | Purpose |
 |---|------|--------|---------|
-| 1 | `-d {host_ip}/32 -p tcp --dport {proxy_port}` | `ACCEPT` | Allow traffic to the proxy |
+| 1 | `-p tcp --dport 443 ! -d {host_ip}/32` | `DNAT --to-destination {host_ip}:{proxy_port}` | Redirect HTTPS bypass traffic to proxy |
+| 2 | `-p tcp --dport 80 ! -d {host_ip}/32` | `DNAT --to-destination {host_ip}:{proxy_port}` | Redirect HTTP bypass traffic to proxy |
+
+**filter table (OUTPUT chain) — bypass detection:**
+
+| # | Rule | Target | Purpose |
+|---|------|--------|---------|
+| 1 | `-d {host_ip}/32 -p tcp --dport {proxy_port}` | `ACCEPT` | Allow traffic to the proxy (explicit and DNAT'd) |
 | 2 | `-o lo` | `ACCEPT` | Allow loopback traffic |
 | 3 | `-m conntrack --ctstate ESTABLISHED,RELATED` | `ACCEPT` | Allow response packets for established connections |
-| 4 | `-p tcp --syn -m limit --limit 5/sec --limit-burst 10 --log-prefix "openshell:bypass:{ns}:"` | `LOG` | Log TCP SYN bypass attempts (rate-limited) |
-| 5 | `-p tcp` | `REJECT --reject-with icmp-port-unreachable` | Reject TCP bypass attempts (fast-fail) |
+| 4 | `-p tcp --syn -m limit --limit 5/sec --limit-burst 10 --log-prefix "openshell:bypass:{ns}:"` | `LOG` | Log TCP SYN bypass attempts on non-standard ports (rate-limited) |
+| 5 | `-p tcp` | `REJECT --reject-with icmp-port-unreachable` | Reject TCP bypass attempts on non-standard ports (fast-fail) |
 | 6 | `-p udp -m limit --limit 5/sec --limit-burst 10 --log-prefix "openshell:bypass:{ns}:"` | `LOG` | Log UDP bypass attempts, including DNS (rate-limited) |
 | 7 | `-p udp` | `REJECT --reject-with icmp-port-unreachable` | Reject UDP bypass attempts (fast-fail) |
 
+Note: TCP traffic on ports 80/443 is DNAT'd to the proxy before reaching the filter table, so the filter rules only catch traffic on other ports. The ACCEPT rule for proxy-destined traffic (rule 1) matches both explicit CONNECT connections and DNAT'd transparent connections.
+
+##### Transparent proxy flow
+
+When a DNAT'd connection arrives at the proxy, `handle_tcp_connection()` detects raw TLS data (not an HTTP CONNECT request) and routes to `handle_transparent_proxy()`:
+
+1. Read the TLS ClientHello from the client
+2. Extract the SNI hostname via `extract_sni()` (parses the TLS extensions)
+3. Evaluate OPA policy for the destination (same identity binding as CONNECT)
+4. Resolve DNS with SSRF protection (`resolve_and_reject_internal`)
+5. Connect to the real upstream server
+6. Replay the buffered ClientHello to upstream
+7. Relay bidirectionally — the TLS handshake completes end-to-end (no MITM termination)
+
+This ensures that applications using libraries like `ws` (Discord.js), `grpc`, or other non-proxy-aware clients transparently route through the sandbox proxy on standard ports.
+
 The LOG rules use the `--log-uid` flag to include the UID of the process that initiated the connection. The log prefix `openshell:bypass:{namespace_name}:` enables the bypass monitor to filter `/dev/kmsg` for events belonging to a specific sandbox.
 
-The proxy port defaults to `3128` unless the policy specifies a different `http_addr`. IPv6 rules mirror the IPv4 rules via `ip6tables`; IPv6 rule installation failure is non-fatal (logged as warning) since IPv4 is the primary path.
+The proxy port defaults to `3128` unless the policy specifies a different `http_addr`. IPv6 rules mirror the IPv4 rules via `ip6tables`; IPv6 rule installation failure is non-fatal (logged as warning) since IPv4 is the primary path. Transparent redirect rules are IPv4-only and best-effort — failure does not prevent bypass detection rules from being installed.
 
-**Graceful degradation:** If iptables is not available (checked via `which iptables`), a warning is logged and rule installation is skipped entirely. The network namespace still provides isolation via routing — processes can only reach the proxy's IP, but without bypass rules they get a timeout rather than an immediate rejection. LOG rule failure is also non-fatal — if the `xt_LOG` kernel module is not loaded, the REJECT rules are still installed for fast-fail behavior.
+**Graceful degradation:** If iptables is not available (checked via `which iptables`), a warning is logged and rule installation is skipped entirely. The network namespace still provides isolation via routing — processes can only reach the proxy's IP, but without bypass rules they get a timeout rather than an immediate rejection. LOG rule failure is also non-fatal — if the `xt_LOG` kernel module is not loaded, the REJECT rules are still installed for fast-fail behavior. Transparent redirect failure is also non-fatal — the bypass detection rules still provide fast-fail for all ports.
 
 ##### /dev/kmsg monitor
 

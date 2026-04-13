@@ -284,6 +284,106 @@ pub fn looks_like_tls(peek: &[u8]) -> bool {
     peek[2] <= 0x04
 }
 
+/// Extract the SNI (Server Name Indication) hostname from a TLS ClientHello.
+///
+/// Parses the TLS record layer, handshake header, and extensions to find the
+/// `server_name` extension (type 0x0000). Returns `None` if the data is not a
+/// valid ClientHello or does not contain an SNI extension.
+///
+/// This is used by the transparent proxy path to determine the intended
+/// destination host when a client connects directly (bypassing HTTP CONNECT).
+pub fn extract_sni(data: &[u8]) -> Option<String> {
+    // Minimum: 5 (record header) + 4 (handshake header) + 2 (version) +
+    //          32 (random) + 1 (session_id_len) = 44 bytes
+    if data.len() < 44 {
+        return None;
+    }
+
+    // TLS record: type=0x16, version, length
+    if data[0] != 0x16 {
+        return None;
+    }
+    let record_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    let record_end = 5 + record_len;
+    if data.len() < record_end {
+        return None;
+    }
+
+    // Handshake: type=0x01 (ClientHello)
+    if data[5] != 0x01 {
+        return None;
+    }
+
+    // Skip handshake header (4 bytes), client version (2), random (32)
+    let mut pos = 5 + 4 + 2 + 32;
+    if pos >= record_end {
+        return None;
+    }
+
+    // Session ID (variable length)
+    let session_id_len = data[pos] as usize;
+    pos += 1 + session_id_len;
+    if pos + 2 > record_end {
+        return None;
+    }
+
+    // Cipher suites (variable length)
+    let cipher_suites_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2 + cipher_suites_len;
+    if pos + 1 > record_end {
+        return None;
+    }
+
+    // Compression methods (variable length)
+    let compression_len = data[pos] as usize;
+    pos += 1 + compression_len;
+    if pos + 2 > record_end {
+        return None;
+    }
+
+    // Extensions length
+    let extensions_len = u16::from_be_bytes([data[pos], data[pos + 1]]) as usize;
+    pos += 2;
+    let extensions_end = pos + extensions_len;
+    if extensions_end > record_end {
+        return None;
+    }
+
+    // Walk extensions looking for server_name (type 0x0000)
+    while pos + 4 <= extensions_end {
+        let ext_type = u16::from_be_bytes([data[pos], data[pos + 1]]);
+        let ext_len = u16::from_be_bytes([data[pos + 2], data[pos + 3]]) as usize;
+        pos += 4;
+
+        if ext_type == 0x0000 && ext_len >= 5 {
+            // SNI extension: server_name_list_length (2) + type (1) + name_length (2) + name
+            let name_list_end = pos + ext_len;
+            if name_list_end > extensions_end {
+                return None;
+            }
+            // Skip server_name_list_length
+            let mut sni_pos = pos + 2;
+            if sni_pos + 3 > name_list_end {
+                return None;
+            }
+            let name_type = data[sni_pos];
+            sni_pos += 1;
+            let name_len = u16::from_be_bytes([data[sni_pos], data[sni_pos + 1]]) as usize;
+            sni_pos += 2;
+            if name_type == 0x00 && sni_pos + name_len <= name_list_end {
+                return std::str::from_utf8(&data[sni_pos..sni_pos + name_len])
+                    .ok()
+                    .map(|s| s.to_string());
+            }
+            return None;
+        }
+
+        pos += ext_len;
+    }
+
+    None
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -375,5 +475,67 @@ mod tests {
         let _ = rustls::crypto::ring::default_provider().install_default();
         let config = build_upstream_client_config();
         assert_eq!(config.alpn_protocols, vec![b"http/1.1".to_vec()]);
+    }
+
+    #[test]
+    fn extract_sni_from_clienthello() {
+        // Minimal TLS 1.2 ClientHello with SNI for "gateway.discord.gg"
+        let hostname = b"gateway.discord.gg";
+        let name_len = hostname.len();
+
+        // Build SNI extension: type(2) + ext_len(2) + list_len(2) + name_type(1) + name_len(2) + name
+        let sni_ext_data_len = 2 + 1 + 2 + name_len; // list_len + type + len + name
+        let mut sni_ext = vec![
+            0x00, 0x00, // extension type: server_name
+        ];
+        sni_ext.extend_from_slice(&(sni_ext_data_len as u16).to_be_bytes()); // extension data length
+        sni_ext.extend_from_slice(&((1 + 2 + name_len) as u16).to_be_bytes()); // server_name_list length
+        sni_ext.push(0x00); // name type: host_name
+        sni_ext.extend_from_slice(&(name_len as u16).to_be_bytes());
+        sni_ext.extend_from_slice(hostname);
+
+        // Extensions block
+        let extensions_len = sni_ext.len();
+        let mut extensions = Vec::new();
+        extensions.extend_from_slice(&(extensions_len as u16).to_be_bytes());
+        extensions.extend_from_slice(&sni_ext);
+
+        // ClientHello body: version(2) + random(32) + session_id(1+0) + cipher_suites(2+2) + compression(1+1) + extensions
+        let mut client_hello_body = vec![
+            0x03, 0x03, // TLS 1.2
+        ];
+        client_hello_body.extend_from_slice(&[0u8; 32]); // random
+        client_hello_body.push(0x00); // session_id length = 0
+        client_hello_body.extend_from_slice(&[0x00, 0x02, 0x00, 0xFF]); // cipher suites: 1 suite
+        client_hello_body.extend_from_slice(&[0x01, 0x00]); // compression: 1 method (null)
+        client_hello_body.extend_from_slice(&extensions);
+
+        // Handshake header: type(1) + length(3)
+        let hello_len = client_hello_body.len();
+        let mut handshake = vec![0x01]; // ClientHello
+        handshake.push(0x00);
+        handshake.extend_from_slice(&(hello_len as u16).to_be_bytes());
+        handshake.extend_from_slice(&client_hello_body);
+
+        // TLS record header: type(1) + version(2) + length(2)
+        let record_len = handshake.len();
+        let mut record = vec![
+            0x16, // ContentType::Handshake
+            0x03, 0x01, // TLS 1.0 record layer
+        ];
+        record.extend_from_slice(&(record_len as u16).to_be_bytes());
+        record.extend_from_slice(&handshake);
+
+        assert_eq!(
+            extract_sni(&record),
+            Some("gateway.discord.gg".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_sni_returns_none_for_non_tls() {
+        assert_eq!(extract_sni(b"GET / HTTP/1.1\r\n"), None);
+        assert_eq!(extract_sni(&[]), None);
+        assert_eq!(extract_sni(&[0x16, 0x03, 0x01]), None); // too short
     }
 }
