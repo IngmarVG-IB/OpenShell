@@ -1294,13 +1294,17 @@ async fn route_inference_request(
         Ok(true)
     } else {
         // Not an inference request — deny
-        eprintln!(
-            "[proxy] inference denied: method={} path={} raw_path={} patterns={:?}",
-            request.method,
-            normalized_path,
-            request.path,
-            ctx.patterns.iter().map(|p| format!("{} {}", p.method, p.path_glob)).collect::<Vec<_>>()
-        );
+        // Debug: write denied inference details to a file readable from sandbox exec
+        if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open("/tmp/inference-denied.log") {
+            use std::io::Write;
+            let _ = writeln!(f,
+                "denied: method={} path={} raw_path={} patterns={:?}",
+                request.method,
+                normalized_path,
+                request.path,
+                ctx.patterns.iter().map(|p| format!("{} {}", p.method, p.path_glob)).collect::<Vec<_>>()
+            );
+        }
         {
             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Open)
