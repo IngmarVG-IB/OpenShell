@@ -57,22 +57,24 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
         },
         // Ollama native API endpoints — used by OpenClaw when provider is
         // configured as ollama with openai-completions API mode.
+        // Mapped to OpenAI protocol names so the router can find a matching
+        // route via the openai provider type's registered routes.
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/api/chat".to_string(),
-            protocol: "ollama_chat".to_string(),
+            protocol: "openai_chat_completions".to_string(),
             kind: "chat_completion".to_string(),
         },
         InferenceApiPattern {
             method: "POST".to_string(),
             path_glob: "/api/generate".to_string(),
-            protocol: "ollama_generate".to_string(),
+            protocol: "openai_completions".to_string(),
             kind: "completion".to_string(),
         },
         InferenceApiPattern {
             method: "GET".to_string(),
             path_glob: "/api/tags".to_string(),
-            protocol: "ollama_tags".to_string(),
+            protocol: "model_discovery".to_string(),
             kind: "models_list".to_string(),
         },
     ]
