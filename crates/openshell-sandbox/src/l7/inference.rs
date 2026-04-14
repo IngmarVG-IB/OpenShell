@@ -16,7 +16,7 @@ pub struct InferenceApiPattern {
     pub kind: String,
 }
 
-/// Default patterns for known inference APIs (`OpenAI`, Anthropic).
+/// Default patterns for known inference APIs (`OpenAI`, Anthropic, Ollama native).
 pub fn default_patterns() -> Vec<InferenceApiPattern> {
     vec![
         InferenceApiPattern {
@@ -54,6 +54,26 @@ pub fn default_patterns() -> Vec<InferenceApiPattern> {
             path_glob: "/v1/models/*".to_string(),
             protocol: "model_discovery".to_string(),
             kind: "models_get".to_string(),
+        },
+        // Ollama native API endpoints — used by OpenClaw when provider is
+        // configured as ollama with openai-completions API mode.
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/api/chat".to_string(),
+            protocol: "ollama_chat".to_string(),
+            kind: "chat_completion".to_string(),
+        },
+        InferenceApiPattern {
+            method: "POST".to_string(),
+            path_glob: "/api/generate".to_string(),
+            protocol: "ollama_generate".to_string(),
+            kind: "completion".to_string(),
+        },
+        InferenceApiPattern {
+            method: "GET".to_string(),
+            path_glob: "/api/tags".to_string(),
+            protocol: "ollama_tags".to_string(),
+            kind: "models_list".to_string(),
         },
     ]
 }
