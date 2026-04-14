@@ -590,16 +590,12 @@ where
                     );
                 }
             } else {
-                // Automatically clean up Docker resources (volume, container, network,
-                // image) so the environment is left in a retryable state.
-                tracing::info!("deploy failed, cleaning up gateway resources for '{name}'");
-                if let Err(cleanup_err) = destroy_gateway_resources(&target_docker, &name).await {
-                    tracing::warn!(
-                        "automatic cleanup after failed deploy also failed: {cleanup_err}. \
-                         Manual cleanup may be required: \
-                         openshell gateway destroy --name {name}"
-                    );
-                }
+                // Skip automatic cleanup so the container stays alive for debugging
+                // or for slow k3s pod initialization (e.g. flannel cold-start).
+                tracing::info!(
+                    "deploy failed for '{name}', skipping automatic cleanup. \
+                     Run `openshell gateway destroy --name {name}` to clean up manually."
+                );
             }
             Err(deploy_err)
         }

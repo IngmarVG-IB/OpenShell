@@ -16,9 +16,65 @@ use std::collections::HashMap;
 use std::io::BufReader;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncRead, AsyncWrite};
+use std::pin::Pin;
+use std::task::{Context, Poll};
+use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::TcpStream;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+
+/// A `TcpStream` wrapper that replays pre-read bytes before delegating to the
+/// underlying stream.  Used by the transparent proxy to feed the already-read
+/// TLS ClientHello back into the TLS acceptor.
+pub struct PrefixedTcpStream {
+    prefix: Vec<u8>,
+    offset: usize,
+    inner: TcpStream,
+}
+
+impl PrefixedTcpStream {
+    pub fn new(prefix: Vec<u8>, inner: TcpStream) -> Self {
+        Self {
+            prefix,
+            offset: 0,
+            inner,
+        }
+    }
+}
+
+impl AsyncRead for PrefixedTcpStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        if self.offset < self.prefix.len() {
+            let remaining = &self.prefix[self.offset..];
+            let to_copy = remaining.len().min(buf.remaining());
+            buf.put_slice(&remaining[..to_copy]);
+            self.offset += to_copy;
+            return Poll::Ready(Ok(()));
+        }
+        Pin::new(&mut self.inner).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for PrefixedTcpStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.inner).poll_shutdown(cx)
+    }
+}
 
 const MAX_CACHED_CERTS: usize = 256;
 
@@ -177,6 +233,21 @@ pub async fn tls_terminate_client(
 ) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
     let acceptor = tls_state.acceptor_for(hostname)?;
     let tls_stream = acceptor.accept(client).await.into_diagnostic()?;
+    Ok(tls_stream)
+}
+
+/// Accept TLS from a sandbox client where the initial bytes (ClientHello) have
+/// already been read.  Wraps the stream with [`PrefixedTcpStream`] so the TLS
+/// acceptor sees the complete handshake.
+pub async fn tls_terminate_client_prefixed(
+    client: TcpStream,
+    prefix: Vec<u8>,
+    tls_state: &ProxyTlsState,
+    hostname: &str,
+) -> Result<impl AsyncRead + AsyncWrite + Unpin + Send> {
+    let acceptor = tls_state.acceptor_for(hostname)?;
+    let prefixed = PrefixedTcpStream::new(prefix, client);
+    let tls_stream = acceptor.accept(prefixed).await.into_diagnostic()?;
     Ok(tls_stream)
 }
 

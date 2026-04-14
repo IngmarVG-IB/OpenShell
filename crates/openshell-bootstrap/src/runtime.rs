@@ -576,7 +576,7 @@ pub async fn restart_openshell_deployment(docker: &Docker, name: &str) -> Result
             "sh".to_string(),
             "-c".to_string(),
             format!(
-                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status {workload_ref} -n openshell --timeout=180s"
+                "KUBECONFIG={KUBECONFIG_PATH} kubectl rollout status {workload_ref} -n openshell --timeout=600s"
             ),
         ],
     )

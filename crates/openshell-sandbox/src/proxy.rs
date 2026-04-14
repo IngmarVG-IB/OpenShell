@@ -320,6 +320,7 @@ async fn handle_tcp_connection(
             identity_cache,
             entrypoint_pid,
             tls_state,
+            inference_ctx,
             secret_resolver,
             denial_tx,
         )
@@ -1963,6 +1964,129 @@ fn rewrite_forward_request(
 ///
 /// This function:
 /// 1. Reads enough data to extract the SNI hostname from the TLS ClientHello
+/// Handle inference interception for the transparent proxy path.
+///
+/// Like [`handle_inference_interception`] but uses a [`PrefixedTcpStream`] to
+/// replay the already-read ClientHello bytes back into the TLS acceptor.
+async fn handle_inference_interception_prefixed(
+    client: TcpStream,
+    prefix: Vec<u8>,
+    host: &str,
+    port: u16,
+    tls_state: Option<&Arc<ProxyTlsState>>,
+    inference_ctx: Option<&Arc<InferenceContext>>,
+) -> Result<InferenceOutcome> {
+    use crate::l7::inference::{
+        ParseResult, format_http_response, try_parse_http_request,
+    };
+
+    let Some(ctx) = inference_ctx else {
+        return Ok(InferenceOutcome::Denied {
+            reason: "cluster inference context not configured".to_string(),
+        });
+    };
+
+    let Some(tls) = tls_state else {
+        return Ok(InferenceOutcome::Denied {
+            reason: "missing TLS state".to_string(),
+        });
+    };
+
+    // TLS-terminate using the prefixed stream so the acceptor sees the full
+    // ClientHello that was already read during SNI extraction.
+    let mut tls_client =
+        match crate::l7::tls::tls_terminate_client_prefixed(client, prefix, tls, host).await {
+            Ok(c) => c,
+            Err(e) => {
+                return Ok(InferenceOutcome::Denied {
+                    reason: format!("TLS handshake failed: {e}"),
+                });
+            }
+        };
+
+    // From here the logic is identical to handle_inference_interception: read
+    // HTTP requests from the plaintext stream and route via route_inference_request.
+    let mut buf = vec![0u8; INITIAL_INFERENCE_BUF];
+    let mut used = 0usize;
+    let mut routed_any = false;
+
+    loop {
+        let n = match tls_client.read(&mut buf[used..]).await {
+            Ok(n) => n,
+            Err(e) => {
+                if routed_any {
+                    break;
+                }
+                return Ok(InferenceOutcome::Denied {
+                    reason: format!("I/O error: {e}"),
+                });
+            }
+        };
+        if n == 0 {
+            if routed_any {
+                break;
+            }
+            return Ok(InferenceOutcome::Denied {
+                reason: "client closed connection".to_string(),
+            });
+        }
+        used += n;
+
+        match try_parse_http_request(&buf[..used]) {
+            ParseResult::Complete(request, consumed) => {
+                let was_routed =
+                    route_inference_request(&request, ctx, &mut tls_client).await?;
+                if was_routed {
+                    routed_any = true;
+                } else if !routed_any {
+                    return Ok(InferenceOutcome::Denied {
+                        reason: "connection not allowed by policy".to_string(),
+                    });
+                }
+                buf.copy_within(consumed..used, 0);
+                used -= consumed;
+            }
+            ParseResult::Incomplete => {
+                if used == buf.len() {
+                    if buf.len() >= MAX_INFERENCE_BUF {
+                        let response = format_http_response(413, &[], b"Payload Too Large");
+                        write_all(&mut tls_client, &response).await?;
+                        if routed_any {
+                            break;
+                        }
+                        return Ok(InferenceOutcome::Denied {
+                            reason: "payload too large".to_string(),
+                        });
+                    }
+                    buf.resize((buf.len() * 2).min(MAX_INFERENCE_BUF), 0);
+                }
+            }
+            ParseResult::Invalid(reason) => {
+                {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Refuse)
+                        .action(ActionId::Denied)
+                        .disposition(DispositionId::Rejected)
+                        .severity(SeverityId::Medium)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, port))
+                        .message(format!(
+                            "Rejecting malformed inference request: {reason}"
+                        ))
+                        .status_detail(&reason)
+                        .build();
+                    ocsf_emit!(event);
+                }
+                let response = format_http_response(400, &[], b"Bad Request");
+                write_all(&mut tls_client, &response).await?;
+                return Ok(InferenceOutcome::Denied { reason });
+            }
+        }
+    }
+
+    Ok(InferenceOutcome::Routed)
+}
+
 /// 2. Evaluates OPA policy for the destination
 /// 3. Resolves DNS with SSRF protection
 /// 4. Connects to the real upstream
@@ -1976,7 +2100,8 @@ async fn handle_transparent_proxy(
     opa_engine: Arc<OpaEngine>,
     identity_cache: Arc<BinaryIdentityCache>,
     entrypoint_pid: Arc<AtomicU32>,
-    _tls_state: Option<Arc<ProxyTlsState>>,
+    tls_state: Option<Arc<ProxyTlsState>>,
+    inference_ctx: Option<Arc<InferenceContext>>,
     _secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
@@ -2005,6 +2130,39 @@ async fn handle_transparent_proxy(
     };
     let host_lc = host.to_ascii_lowercase();
     let port = 443u16;
+
+    // Special case: inference.local requires TLS termination + HTTP inspection,
+    // same as the explicit CONNECT path. The transparent proxy must not relay
+    // raw TLS to the inference backend (which speaks plain HTTP).
+    if host_lc == INFERENCE_LOCAL_HOST {
+        info!(
+            host = %host_lc,
+            "Transparent proxy: intercepting inference.local for TLS termination"
+        );
+        let outcome = handle_inference_interception_prefixed(
+            client,
+            buf,
+            INFERENCE_LOCAL_HOST,
+            port,
+            tls_state.as_ref(),
+            inference_ctx.as_ref(),
+        )
+        .await?;
+        if let InferenceOutcome::Denied { reason } = outcome {
+            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                .activity(ActivityId::Open)
+                .action(ActionId::Denied)
+                .disposition(DispositionId::Blocked)
+                .severity(SeverityId::Medium)
+                .status(StatusId::Failure)
+                .dst_endpoint(Endpoint::from_domain(INFERENCE_LOCAL_HOST, port))
+                .message(format!("Transparent proxy inference interception denied: {reason}"))
+                .status_detail(&reason)
+                .build();
+            ocsf_emit!(event);
+        }
+        return Ok(());
+    }
 
     let peer_addr = client.peer_addr().into_diagnostic()?;
 
