@@ -2088,11 +2088,11 @@ async fn handle_inference_interception_prefixed(
 }
 
 /// 2. Evaluates OPA policy for the destination
-/// 3. Resolves DNS with SSRF protection
-/// 4. Connects to the real upstream
-/// 5. Replays the buffered ClientHello data
-/// 6. Relays bidirectionally (the TLS handshake completes end-to-end between
-///    client and upstream — no MITM termination)
+/// 3. Queries L7 endpoint config — if the endpoint has `tls: terminate` or an
+///    L7 protocol, performs TLS MITM termination and relays with inspection
+/// 4. Otherwise resolves DNS with SSRF protection, connects to the real
+///    upstream, replays the buffered ClientHello, and relays bidirectionally
+///    (the TLS handshake completes end-to-end — no MITM termination)
 #[allow(clippy::too_many_arguments)]
 async fn handle_transparent_proxy(
     mut client: TcpStream,
@@ -2102,7 +2102,7 @@ async fn handle_transparent_proxy(
     entrypoint_pid: Arc<AtomicU32>,
     tls_state: Option<Arc<ProxyTlsState>>,
     inference_ctx: Option<Arc<InferenceContext>>,
-    _secret_resolver: Option<Arc<SecretResolver>>,
+    secret_resolver: Option<Arc<SecretResolver>>,
     denial_tx: Option<mpsc::UnboundedSender<DenialEvent>>,
 ) -> Result<()> {
     // Buffer for accumulating the ClientHello if the first read wasn't enough.
@@ -2217,6 +2217,147 @@ async fn handle_transparent_proxy(
         }
         NetworkAction::Allow { .. } => {}
     }
+
+    // Check if endpoint has L7 config or explicit TLS termination policy.
+    // If the policy says to terminate TLS, we MITM the connection the same
+    // way the explicit CONNECT proxy path does — otherwise Discord, Slack,
+    // and other channels that use WebSocket over TLS cannot connect because
+    // their traffic goes through the transparent proxy (iptables DNAT) which
+    // would otherwise relay the raw TLS end-to-end to an address that the
+    // sandbox resolved via /etc/hosts (not the real upstream).
+    let l7_config = query_l7_config(&opa_engine, &decision, &host_lc, port);
+    let effective_tls_skip =
+        query_tls_mode(&opa_engine, &decision, &host_lc, port) == crate::l7::TlsMode::Skip;
+
+    if l7_config.is_some() && !effective_tls_skip {
+        if let Some(ref tls) = tls_state {
+            info!(
+                host = %host_lc,
+                port = port,
+                "Transparent proxy: TLS termination + L7 inspection for policy-configured host"
+            );
+
+            let matched_policy = match &decision.action {
+                NetworkAction::Allow { matched_policy } => {
+                    matched_policy.clone().unwrap_or_default()
+                }
+                _ => String::new(),
+            };
+
+            let ctx = crate::l7::relay::L7EvalContext {
+                host: host_lc.clone(),
+                port,
+                policy_name: matched_policy,
+                binary_path: decision
+                    .binary
+                    .as_ref()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default(),
+                ancestors: decision
+                    .ancestors
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                cmdline_paths: decision
+                    .cmdline_paths
+                    .iter()
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .collect(),
+                secret_resolver: secret_resolver.clone(),
+            };
+
+            let tls_result = async {
+                // Terminate TLS from client using PrefixedTcpStream so the
+                // TLS acceptor sees the complete ClientHello that was already
+                // read during SNI extraction.
+                let mut tls_client =
+                    crate::l7::tls::tls_terminate_client_prefixed(client, buf, tls, &host_lc)
+                        .await?;
+
+                // Resolve DNS and connect to real upstream.
+                let addrs = resolve_and_reject_internal(&host_lc, port).await.map_err(
+                    |reason| {
+                        miette::miette!("Transparent proxy: SSRF check blocked {host_lc}:{port}: {reason}")
+                    },
+                )?;
+                let upstream = TcpStream::connect(addrs.as_slice())
+                    .await
+                    .into_diagnostic()?;
+
+                // Establish TLS to real upstream with proper certificate
+                // verification (using Mozilla root CAs).
+                let mut tls_upstream = crate::l7::tls::tls_connect_upstream(
+                    upstream,
+                    &host_lc,
+                    tls.upstream_config(),
+                )
+                .await?;
+
+                // Relay with L7 inspection or credential injection.
+                if let Some(ref l7_config) = l7_config {
+                    let tunnel_engine =
+                        opa_engine.clone_engine_for_tunnel().unwrap_or_else(|e| {
+                            let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                                .activity(ActivityId::Fail)
+                                .severity(SeverityId::Low)
+                                .status(StatusId::Failure)
+                                .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                                .message(format!(
+                                    "Failed to clone OPA engine for L7, falling back to relay-only: {e}"
+                                ))
+                                .build();
+                            ocsf_emit!(event);
+                            regorus::Engine::new()
+                        });
+                    crate::l7::relay::relay_with_inspection(
+                        l7_config,
+                        std::sync::Mutex::new(tunnel_engine),
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        &ctx,
+                    )
+                    .await
+                } else {
+                    crate::l7::relay::relay_passthrough_with_credentials(
+                        &mut tls_client,
+                        &mut tls_upstream,
+                        &ctx,
+                    )
+                    .await
+                }
+            };
+
+            if let Err(e) = tls_result.await {
+                if is_benign_relay_error(&e) {
+                    debug!(
+                        host = %host_lc,
+                        port = port,
+                        error = %e,
+                        "Transparent proxy: TLS connection closed"
+                    );
+                } else {
+                    let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
+                        .activity(ActivityId::Fail)
+                        .severity(SeverityId::Low)
+                        .status(StatusId::Failure)
+                        .dst_endpoint(Endpoint::from_domain(&host_lc, port))
+                        .message(format!("Transparent proxy: TLS relay error: {e}"))
+                        .build();
+                    ocsf_emit!(event);
+                }
+            }
+            return Ok(());
+        }
+        // Fall through to end-to-end relay if TLS state isn't configured.
+        warn!(
+            host = %host_lc,
+            port = port,
+            "Transparent proxy: L7 config present but TLS state not configured, falling back to end-to-end relay"
+        );
+    }
+
+    // End-to-end relay — no TLS termination. The TLS handshake completes
+    // between client and upstream directly.
 
     // DNS resolution with SSRF protection.
     let addrs = match resolve_and_reject_internal(&host_lc, port).await {
