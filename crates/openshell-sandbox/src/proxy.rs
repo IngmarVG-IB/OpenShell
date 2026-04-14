@@ -1294,6 +1294,13 @@ async fn route_inference_request(
         Ok(true)
     } else {
         // Not an inference request — deny
+        eprintln!(
+            "[proxy] inference denied: method={} path={} raw_path={} patterns={:?}",
+            request.method,
+            normalized_path,
+            request.path,
+            ctx.patterns.iter().map(|p| format!("{} {}", p.method, p.path_glob)).collect::<Vec<_>>()
+        );
         {
             let event = NetworkActivityBuilder::new(crate::ocsf_ctx())
                 .activity(ActivityId::Open)
